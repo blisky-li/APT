@@ -6,7 +6,7 @@ from basicts.utils import data_transformation_4_xformer
 from typing import Union, List
 
 from ..arch import iTransformer, Informer, Autoformer, DLinear, PatchTST, UMixer
-from ..normalization import DAIN, SIN, RevIN, DishTS, FredNormer, TAN, FAN, SAN, EvoMSN ## FAN, EVOMSN, SAN
+from ..normalization import DAIN, RevIN, DishTS, APT, FAN, SAN
 
 model_dict = {
     'Informer': Informer,
@@ -19,13 +19,10 @@ model_dict = {
 
 normalization_dict = {
     'DAIN': DAIN,
-    'SIN': SIN,
     'RevIN': RevIN,
     'DishTS': DishTS,
-    'FredNormer': FredNormer,
     'FAN': FAN,
     'SAN': SAN,
-    'EvoMSN': EvoMSN,
 }
 
 class ModelWithNormalization(nn.Module):
@@ -39,18 +36,13 @@ class ModelWithNormalization(nn.Module):
             self.normalization = normalization_dict[self.normalization_name](**model_args)
         self.use_TAN = model_args['use_tan']
         if self.use_TAN:
-            self.time_embedding = TAN(**model_args)
+            self.time_embedding = APT(**model_args)
             self.station_lambda = model_args['station_lambda']
-        '''if self.normalization_name:
-            # 显式命名归一化模块
-            self.add_module('normalization',
-                            normalization_dict[self.normalization_name](**model_args))  # 名称固定为'normalization'''
+
 
         self.is_xformer = model_args['is_xformer']
         self.use_TAN = model_args['use_tan']
-        '''if self.use_TAN:
-            # 显式命名时间嵌入模块
-            self.add_module('time_embedding', TAN(**model_args))  # 名称固定为'time_embedding'''
+
         self.label_len = model_args['label_len']
 
 
@@ -70,17 +62,17 @@ class ModelWithNormalization(nn.Module):
         if self.use_TAN:
             times_w, times_b = self.time_embedding(x_mark_enc, x_mark_dec)
 
-            x_enc = x_enc * times_w  # + times_b
+            x_enc = x_enc * times_w + times_b
         if self.is_xformer:
 
-            dec_out = self.model(x_enc=x_enc, x_mark_enc=x_mark_enc, x_dec=x_dec,x_mark_dec=x_mark_dec, train=train)
+            dec_out = self.model(x_enc=x_enc, x_mark_enc=x_mark_enc, x_dec=x_dec, x_mark_dec=x_mark_dec, train=train)
         else:
             dec_out = self.model(x_enc, future_data, batch_seen, epoch, train, **kwargs)
         # print(dec_out.shape)
         if self.use_TAN:
             # print(times_w.shape)
             # print(dec_out.shape, times_w.shape)
-            dec_out = dec_out / times_w
+            dec_out = (dec_out - times_b) / times_w
         if self.normalization_name in normalization_dict.keys():
             dec_out = self.normalization(dec_out, 'denorm')
 

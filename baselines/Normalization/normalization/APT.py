@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-class TAN(nn.Module):
+class APT(nn.Module):
     def __init__(self, **model_args):
         super().__init__()
         self.timestamp_dim = model_args['timestamp_dim']
