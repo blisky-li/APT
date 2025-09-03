@@ -12,8 +12,9 @@ from typing import Tuple, Union, Optional, Dict
 from tqdm import tqdm
 from basicts.runners import BaseTimeSeriesForecastingRunner
 from easytorch.utils import TimePredictor, get_local_rank, is_master, master_only
-from ..loss import orthogonality, station_loss, diversity
-
+from ..loss import orthogonality, station_loss, diversity, msn_station_loss, smooth_loss, l2, balance_loss
+from easytorch.core.checkpoint import (backup_last_ckpt, clear_ckpt, load_ckpt,
+                                       save_ckpt)
 class NormalizeTimeSeriesForecastingRunner(BaseTimeSeriesForecastingRunner):
 
     def __init__(self, cfg: Dict):
@@ -21,21 +22,51 @@ class NormalizeTimeSeriesForecastingRunner(BaseTimeSeriesForecastingRunner):
         super().__init__(cfg)
         self.forward_features = cfg['MODEL'].get('FORWARD_FEATURES', None)
         self.target_features = cfg['MODEL'].get('TARGET_FEATURES', None)
+        self.target_time_series = cfg['MODEL'].get('TARGET_TIME_SERIES', None)
+
         self.normalization_name = cfg['MODEL'].get('NORMALIZE', None)
         self.model_use_tan = cfg['MODEL'].get('USETAN', None)
         self.pred_len = cfg['MODEL']['PARAM']['pred_len']
+        self.top_k = cfg['MODEL']['PARAM']['top_k']
 
         if self.normalization_name == 'SAN':
             self.period_len = cfg['MODEL']['PARAM']['period_len']
-        if self.normalization_name == 'SAN' or 'MSN' in self.normalization_name:
+        if self.normalization_name == 'SAN' or 'MSN' in self.normalization_name or 'Dish' in self.normalization_name:
             self.station_pretrain_epoch = cfg['MODEL']['PARAM']['station_pretrain_epoch']
             self.station_lambda = cfg['MODEL']['PARAM']['station_lambda']
         if self.model_use_tan:
             self.tan_epoch = cfg['MODEL']['PARAM']['tan_epoch']
             self.station_lambda = cfg['MODEL']['PARAM']['station_lambda']
             self.station_pretrain_epoch = cfg['MODEL']['PARAM']['station_pretrain_epoch']
+            self.tan_loss = []
         else:
             self.tan_epoch = 0
+        if 'MSN' in self.normalization_name:
+            self.period_list = cfg['MODEL']['PARAM']["periods"]
+
+        if self.model_use_tan:
+            if self.normalization_name != 'None':
+                self.submodules = {
+                    'model': self.model.model,  # 注意是self.model的内部成员
+                    'normalization': self.model.normalization,
+                    'time_embedding': self.model.time_embedding
+                }
+            else:
+                self.submodules = {
+                    'model': self.model.model,  # 注意是self.model的内部成员
+                    'time_embedding': self.model.time_embedding
+                }
+        else:
+            if self.normalization_name != 'None':
+                self.submodules = {
+                    'model': self.model.model,  # 注意是self.model的内部成员
+                    'normalization': self.model.normalization,
+                }
+            else:
+                self.submodules = {
+                    'model': self.model.model,  # 注意是self.model的内部成员
+                }
+
 
     def select_input_features(self, data: torch.Tensor) -> torch.Tensor:
         """
@@ -85,13 +116,57 @@ class NormalizeTimeSeriesForecastingRunner(BaseTimeSeriesForecastingRunner):
         max_period = self.pred_len * 2
         max_freq = l // max_period + 1
         amps[0:max_freq] = 0
-        top_list = amps.topk(20).indices
+        top_list = amps.topk(self.top_k).indices
         period_list = l // top_list
         period_weight = F.softmax(amps[top_list], dim=0)
         self.period_list = period_list
         self.period_weight = period_weight
-        # print(self.period_list)
-        # print(self.period_weight)
+        # np.save('PEMS04_Top_periods.npy', self.period_list.cpu().detach().numpy())
+
+
+    def preprocessing(self, input_data: Dict) -> Dict:
+        """Preprocess data.
+
+        Args:
+            input_data (Dict): Dictionary containing data to be processed.
+
+        Returns:
+            Dict: Processed data.
+        """
+
+        if self.scaler is not None:
+            input_data['target'] = self.scaler.transform(input_data['target'])
+            input_data['inputs'] = self.scaler.transform(input_data['inputs'])
+        # TODO: add more preprocessing steps as needed.
+        return input_data
+
+    def postprocessing(self, input_data: Dict) -> Dict:
+        """Postprocess data.
+
+        Args:
+            input_data (Dict): Dictionary containing data to be processed.
+
+        Returns:
+            Dict: Processed data.
+        """
+
+        # rescale data
+        if self.scaler is not None and self.scaler.rescale:
+            input_data['prediction'] = self.scaler.inverse_transform(input_data['prediction'])
+            input_data['target'] = self.scaler.inverse_transform(input_data['target'])
+            input_data['inputs'] = self.scaler.inverse_transform(input_data['inputs'])
+
+        # subset forecasting
+        if self.target_time_series is not None:
+            input_data['target'] = input_data['target'][:, :, self.target_time_series, :]
+            input_data['prediction'] = input_data['prediction'][:, :, self.target_time_series, :]
+
+        # TODO: add more postprocessing steps as needed.
+        return input_data
+
+    '''def loss_monitor(self, cfg: Dict):'''
+
+
 
     def train(self, cfg: Dict):
         """Train model.
@@ -119,18 +194,25 @@ class NormalizeTimeSeriesForecastingRunner(BaseTimeSeriesForecastingRunner):
         train_time_predictor = TimePredictor(self.start_epoch, self.num_epochs)
 
         # training loop
-        epoch_index = 0
-        if self.normalization_name == 'SAN' or 'MSN' in self.normalization_name:
+        # epoch_index = 0
+        if self.normalization_name == 'SAN' or 'MSN' in self.normalization_name or 'Dish' in self.normalization_name:
             self.num_epochs += self.station_pretrain_epoch
         if self.model_use_tan:
             self.num_epochs += self.tan_epoch
-        for epoch_index in range(self.start_epoch, self.num_epochs):
+
+        epoch_index = self.start_epoch
+        early_stop = False
+        while epoch_index < self.num_epochs and not early_stop:
+            self.tan_loss = []
             # early stopping
             if self.early_stopping_patience is not None and self.current_patience <= 0:
                 self.logger.info('Early stopping.')
-                break
+                early_stop = True
+                # break
 
             epoch = epoch_index + 1
+
+
             self.on_epoch_start(epoch)
             epoch_start_time = time.time()
             # start training
@@ -142,25 +224,24 @@ class NormalizeTimeSeriesForecastingRunner(BaseTimeSeriesForecastingRunner):
             else:
                 data_loader = self.train_data_loader
 
-            if epoch == 1:
-                self._get_period(data_loader)
+            # MSN get main periods from all training datasets
+            '''if epoch == 1: #and 'MSN' in self.normalization_name:
+                self._get_period(data_loader)'''
 
             data_loader = tqdm(data_loader) if get_local_rank() == 0 else data_loader
-
-
-
             # data loop
             for iter_index, data in enumerate(data_loader):
                 loss = self.train_iters(epoch, iter_index, data)
                 if loss is not None:
                     self.backward(loss)
-            # update lr_scheduler
+
+            # update lr scheduler
             if self.scheduler is not None:
                 self.scheduler.step()
 
             epoch_end_time = time.time()
             # epoch time
-            self.update_epoch_meter('train_time', epoch_end_time - epoch_start_time)
+            self.update_epoch_meter('train/time', epoch_end_time - epoch_start_time)
             self.on_epoch_end(epoch)
 
             expected_end_time = train_time_predictor.get_expected_end_time(epoch)
@@ -170,6 +251,7 @@ class NormalizeTimeSeriesForecastingRunner(BaseTimeSeriesForecastingRunner):
                 self.logger.info('The estimated training finish time is {}'.format(
                     time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(expected_end_time))))
 
+            epoch_index += 1 #$### 非常重要，不能修改！！！！！！！！！！
         # log training finish time
         self.logger.info('The training finished at {}'.format(
             time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())
@@ -205,165 +287,353 @@ class NormalizeTimeSeriesForecastingRunner(BaseTimeSeriesForecastingRunner):
             torch.Tensor: Loss value.
         """
         iter_num = (epoch - 1) * self.iter_per_epoch + iter_index
-        data = self.preprocessing(data)
 
+        if self.normalization_name == 'SAN' or self.normalization_name == 'FAN': # For SAN & FAN
+            if self.tan_epoch >= epoch  and self.model_use_tan:
 
+                if iter_num % self.iter_per_epoch == 0:
+                    print('SAN or MSN Pretraining Mode')
 
-        if self.normalization_name == 'SAN' or 'MSN' in self.normalization_name:
-            if self.tan_epoch < epoch <= self.station_pretrain_epoch + self.tan_epoch and self.model_use_tan:
                 self._apply_freeze_rules(False, False, True)
-                forward_return = self.forward(data=data, epoch=epoch, iter_num=iter_num, train=True)
-                forward_return = self.postprocessing(forward_return)
 
+                forward_return = self.forward(data=data, epoch=epoch, iter_num=iter_num, train=True)
                 if self.cl_param:
                     cl_length = self.curriculum_learning(epoch=epoch)
                     forward_return['prediction'] = forward_return['prediction'][:, :cl_length, :, :]
                     forward_return['target'] = forward_return['target'][:, :cl_length, :, :]
 
-                '''if 'lambda' not in forward_return.keys() and self.model_use_tan:
-                    loss = self.metric_forward(self.loss, forward_return) + self.station_lambda * orthogonality(
-                        forward_return['orthogonality'])
-                else:'''
-                if self.model_use_tan:
-                    loss = (self.metric_forward(self.loss, forward_return) + self.station_lambda * orthogonality(forward_return['orthogonality'])) * 10# self.metric_forward(self.loss, forward_return)
-                else:
-                    loss = self.metric_forward(self.loss, forward_return)
+                loss = self.station_lambda * (orthogonality(forward_return['orthogonality']) + balance_loss(
+                        forward_return['load']) + l2(forward_return['w']) + l2(
+                        forward_return['b']))
 
+                self.tan_loss.append(orthogonality(forward_return['orthogonality']).item() + balance_loss(
+                        forward_return['load']).item() + l2(forward_return['w']).item() + l2(
+                        forward_return['b']).item())
+
+                self.update_epoch_meter('train/loss', loss.item())
                 for metric_name, metric_func in self.metrics.items():
                     metric_item = self.metric_forward(metric_func, forward_return)
-                    self.update_epoch_meter(f'train_{metric_name}', metric_item.item())
-                return loss
-
-
-            elif epoch <= self.station_pretrain_epoch:
-                # print('model_freeze')
-                """统一冻结逻辑"""
-                # 定义冻结规则：冻结模型主体和时间嵌入，解冻归一化模块
-                self._apply_freeze_rules(False, True, False)
-
-                # print(prediction.shape)
-
-                forward_return = self.forward(data=data, epoch=epoch, iter_num=iter_num, train=True)
-                forward_return = self.postprocessing(forward_return)
-
-                if self.cl_param:
-                    cl_length = self.curriculum_learning(epoch=epoch)
-                    forward_return['prediction'] = forward_return['prediction'][:, :cl_length, :, :]
-                    forward_return['target'] = forward_return['target'][:, :cl_length, :, :]
-
-                target = forward_return['target'].squeeze()
-
-                model_station_loss = station_loss(target, self.model.normalization.station_pred, self.period_len)
-                loss = model_station_loss * self.station_lambda
-                '''if self.model_use_tan:
-                    loss = loss + self.station_lambda * orthogonality(forward_return['orthogonality'])'''
-                for metric_name, metric_func in self.metrics.items():
-                    metric_item = self.metric_forward(metric_func, forward_return)
-                    self.update_epoch_meter(f'train_{metric_name}', metric_item.item())
-                # print(loss)
+                    self.update_epoch_meter(f'train/{metric_name}', metric_item.item())
                 return loss
 
             else:
                 # print('normalization_freeze')
+                if iter_num % self.iter_per_epoch == 0:
+                    print('SAN OR MSN Training Mode')
                 """反向冻结规则"""
-                self._apply_freeze_rules(True, False, True)
-
-                '''
-                                elif self.station_pretrain_epoch + 1 < epoch <= self.station_pretrain_epoch + 5:
-                                    for name, param in self.model.named_parameters():
-                                        if name.startswith('model.'):  # 根据前缀识别模块
-                                            param.requires_grad = True
-                                    if hasattr(self.model, 'normalization'):
-                                        for param in self.model.normalization.parameters():
-                                            param.requires_grad = False
-                                    # 冻结时间嵌入模块
-                                    if self.model.use_TAN:
-                                        for param in self.model.time_embedding.parameters():
-                                            param.requires_grad = True
-                                '''
-                # print(prediction.shape)
+                self._apply_freeze_rules(True, True, True)
 
                 forward_return = self.forward(data=data, epoch=epoch, iter_num=iter_num, train=True)
-                forward_return = self.postprocessing(forward_return)
+                # forward_return = self.postprocessing(forward_return)
 
                 if self.cl_param:
                     cl_length = self.curriculum_learning(epoch=epoch)
                     forward_return['prediction'] = forward_return['prediction'][:, :cl_length, :, :]
                     forward_return['target'] = forward_return['target'][:, :cl_length, :, :]
 
-                if self.model_use_tan:
-                    loss = self.metric_forward(self.loss, forward_return) + self.station_lambda * orthogonality(
-                        forward_return['orthogonality'])
-                else:
-                    loss = self.metric_forward(self.loss, forward_return)
+                loss = self.metric_forward(self.loss, forward_return)
+                if self.normalization_name == 'FAN':
+                    loss += self.model.normalization.loss(forward_return['target'])
+                if self.normalization_name == 'SAN':
+                    target = forward_return['target'].squeeze()
+                    if isinstance(self.model.normalization, torch.nn.ModuleList):
+                        loss += station_loss(target, self.model.normalization[0].station_pred, self.period_len)
+                    else:
+                        loss += station_loss(target, self.model.normalization.station_pred, self.period_len)
 
+                self.update_epoch_meter('train/loss', loss.item())
                 for metric_name, metric_func in self.metrics.items():
                     metric_item = self.metric_forward(metric_func, forward_return)
-                    self.update_epoch_meter(f'train_{metric_name}', metric_item.item())
+                    self.update_epoch_meter(f'train/{metric_name}', metric_item.item())
                 return loss
 
-        elif self.model_use_tan and self.tan_epoch != 0:
+
+        elif self.model_use_tan:  # DishTS & RevIN:
             if epoch <= self.tan_epoch:
-                self._apply_freeze_rules(False, True, True)
+
+                if iter_num % self.iter_per_epoch == 0:
+                    print('Regular APT pretraining Mode')
+
+                self._apply_freeze_rules(False, False, True)
+
                 forward_return = self.forward(data=data, epoch=epoch, iter_num=iter_num, train=True)
-                forward_return = self.postprocessing(forward_return)
+
                 if self.cl_param:
                     cl_length = self.curriculum_learning(epoch=epoch)
                     forward_return['prediction'] = forward_return['prediction'][:, :cl_length, :, :]
                     forward_return['target'] = forward_return['target'][:, :cl_length, :, :]
 
-                if 'lambda' in forward_return.keys() and self.model_use_tan:
-                    loss = self.metric_forward(self.loss,forward_return)#  + self.station_lambda * orthogonality(forward_return['orthogonality'])
-                else:
-                    loss = self.metric_forward(self.loss, forward_return)
+                if iter_num % self.iter_per_epoch == 0:
+                    print('None MODE,TAN')
+
+                loss = self.station_lambda * (orthogonality(forward_return['orthogonality']) + balance_loss(
+                        forward_return['load']) + l2(forward_return['w']) + l2(
+                        forward_return['b']))
+
+                self.update_epoch_meter('train/loss', loss.item())
 
                 for metric_name, metric_func in self.metrics.items():
                     metric_item = self.metric_forward(metric_func, forward_return)
-                    self.update_epoch_meter(f'train_{metric_name}', metric_item.item())
+                    self.update_epoch_meter(f'train/{metric_name}', metric_item.item())
+
+            elif epoch == (self.tan_epoch + 1):
+
+                if iter_num % self.iter_per_epoch == 0:
+                    print('Regular APT pretraining Mode')
+
+                self._apply_freeze_rules(False, False, True)
+
+                forward_return = self.forward(data=data, epoch=epoch, iter_num=iter_num, train=True)
+
+                if self.cl_param:
+                    cl_length = self.curriculum_learning(epoch=epoch)
+                    forward_return['prediction'] = forward_return['prediction'][:, :cl_length, :, :]
+                    forward_return['target'] = forward_return['target'][:, :cl_length, :, :]
+
+                if iter_num % self.iter_per_epoch == 0:
+                        print('None MODE,TAN')
+
+                loss = self.metric_forward(self.loss, forward_return)
+
+                self.update_epoch_meter('train/loss', loss.item())
+
+                for metric_name, metric_func in self.metrics.items():
+                    metric_item = self.metric_forward(metric_func, forward_return)
+
+                    self.update_epoch_meter(f'train/{metric_name}', metric_item.item())
+
+
             else:
+                if iter_num % self.iter_per_epoch == 0:
+                    print('Regular APT Training Mode')
 
-                # self._apply_freeze_rules(True, True, False)
-                self._apply_freeze_rules(True, True, True)
+                self._apply_freeze_rules(True, True, False)
+
                 forward_return = self.forward(data=data, epoch=epoch, iter_num=iter_num, train=True)
-                forward_return = self.postprocessing(forward_return)
+
                 if self.cl_param:
                     cl_length = self.curriculum_learning(epoch=epoch)
                     forward_return['prediction'] = forward_return['prediction'][:, :cl_length, :, :]
                     forward_return['target'] = forward_return['target'][:, :cl_length, :, :]
 
-                if 'lambda' in forward_return.keys() and self.model_use_tan:
-                    loss = self.metric_forward(self.loss, forward_return) + self.station_lambda * (orthogonality(forward_return['orthogonality']) + diversity(forward_return['orthogonality']))#+ self.station_lambda * diversity(forward_return['orthogonality'])# self.station_lambda * (orthogonality(forward_return['orthogonality']) + diversity(forward_return['orthogonality']))
-                else:
-                    loss = self.metric_forward(self.loss, forward_return)
+                if iter_num % self.iter_per_epoch == 0:
+                    print('None MODE ORI')
+
+                loss = self.metric_forward(self.loss, forward_return)
+                self.update_epoch_meter('train/loss', loss.item())
 
                 for metric_name, metric_func in self.metrics.items():
                     metric_item = self.metric_forward(metric_func, forward_return)
-                    self.update_epoch_meter(f'train_{metric_name}', metric_item.item())
+                    self.update_epoch_meter(f'train/{metric_name}', metric_item.item())
 
             return loss
 
-
         else:
+            if iter_num % self.iter_per_epoch == 0:
+                print('Regular Training Mode')
             self._apply_freeze_rules(True, True, False)
+
             forward_return = self.forward(data=data, epoch=epoch, iter_num=iter_num, train=True)
-            forward_return = self.postprocessing(forward_return)
+            # forward_return = self.postprocessing(forward_return)
             if self.cl_param:
                 cl_length = self.curriculum_learning(epoch=epoch)
                 forward_return['prediction'] = forward_return['prediction'][:, :cl_length, :, :]
                 forward_return['target'] = forward_return['target'][:, :cl_length, :, :]
 
-            if 'lambda' in forward_return.keys() and self.model_use_tan:
-                loss = self.metric_forward(self.loss, forward_return)# + self.station_lambda * 5 * orthogonality(forward_return['orthogonality'])
+            if self.model_use_tan:
+                loss = self.metric_forward(self.loss, forward_return)
             else:
                 loss = self.metric_forward(self.loss, forward_return)
-
+            if self.normalization_name == 'FAN':
+                loss += self.model.normalization.loss(forward_return['target'])
+            self.update_epoch_meter('train/loss', loss.item())
             for metric_name, metric_func in self.metrics.items():
                 metric_item = self.metric_forward(metric_func, forward_return)
-                self.update_epoch_meter(f'train_{metric_name}', metric_item.item())
+                self.update_epoch_meter(f'train/{metric_name}', metric_item.item())
 
             return loss
 
+    @master_only
+    def save_model(self, epoch: int):
+        """Save checkpoint for all submodules and meta information."""
 
+        os.makedirs(self.ckpt_save_dir, exist_ok=True)
+
+        # 保存每个模块的 state_dict
+        for name, module in self.submodules.items():
+            ckpt_path = self.get_ckpt_path(epoch, name)
+            torch.save(module.state_dict(), ckpt_path)
+
+        # 保存 meta 信息
+        meta = {
+            'epoch': epoch,
+            'optim_state_dict': self.optim.state_dict(),
+            'best_metrics': self.best_metrics
+        }
+        meta_path = os.path.join(self.ckpt_save_dir,
+                                 f"{self.model_name}_meta_{str(epoch).zfill(len(str(self.num_epochs)))}.pt")
+        torch.save(meta, meta_path)
+
+        # ---------- 修改后的备份逻辑 ----------
+        last_epoch = epoch - 1
+        for name in self.submodules.keys():
+            last_ckpt_path = self.get_ckpt_path(last_epoch, name)
+            backup_last_ckpt(last_ckpt_path, epoch, self.ckpt_save_strategy)
+
+        # meta 也备份
+        last_meta_path = os.path.join(self.ckpt_save_dir,
+                                      f"{self.model_name}_meta_{str(last_epoch).zfill(len(str(self.num_epochs)))}.pt")
+        backup_last_ckpt(last_meta_path, epoch, self.ckpt_save_strategy)
+
+        # ---------- 清理逻辑 ----------
+        if epoch % 10 == 0 or epoch == self.num_epochs:
+            clear_ckpt(self.ckpt_save_dir)  # 建议你清理时匹配 {model_name}_*_{epoch}.pt 的格式
+
+    @master_only
+    def save_best_model(self, epoch: int, metric_name: str, greater_best: bool = True):
+        metric = self.meter_pool.get_avg(metric_name)
+        best_metric = self.best_metrics.get(metric_name)
+
+        if best_metric is None or (metric > best_metric if greater_best else metric < best_metric):
+            self.best_metrics[metric_name] = metric
+            ckpt_dir = self.ckpt_save_dir
+
+            for name, module in self.submodules.items():
+                ckpt_path = os.path.join(ckpt_dir, f"{self.model_name}_{name}_best_{metric_name.replace('/', '_')}.pt")
+                torch.save(module.state_dict(), ckpt_path)
+
+            meta = {
+                'epoch': epoch,
+                'optim_state_dict': self.optim.state_dict(),
+                'best_metrics': self.best_metrics
+            }
+            meta_path = os.path.join(ckpt_dir, f"{self.model_name}_meta_best_{metric_name.replace('/', '_')}.pt")
+            torch.save(meta, meta_path)
+
+            self.current_patience = self.early_stopping_patience
+        else:
+            if self.early_stopping_patience is not None:
+                self.current_patience -= 1
+
+    def load_model(self, ckpt_path: str = None, strict: bool = True) -> None:
+        """Load state dicts for all submodules.
+
+        Args:
+            ckpt_path (str, optional): any one of the module ckpt paths (e.g., model_best_val_MAE.pt),
+                or a manually constructed single string indicating the checkpoint set to load.
+        """
+        try:
+            if ckpt_path is not None:
+                base = os.path.basename(ckpt_path)
+
+                # 是否为 best 模型
+                if '_best_' in base:
+                    suffix = base.split('_best_')[-1].replace('.pt', '')  # e.g., val_MAE
+                    for name, module in self.submodules.items():
+                        sub_path = os.path.join(
+                            self.ckpt_save_dir,
+                            f"{self.model_name}_{name}_best_{suffix}.pt"
+                        )
+                        module.load_state_dict(torch.load(sub_path), strict=strict)
+
+                # 是否为 epoch 模型
+                elif base.endswith('.pt') and base.split('_')[-1].replace('.pt', '').isdigit():
+                    epoch = int(base.split('_')[-1].replace('.pt', ''))
+                    for name, module in self.submodules.items():
+                        sub_path = self.get_ckpt_path(epoch, name)
+                        module.load_state_dict(torch.load(sub_path), strict=strict)
+                else:
+                    raise ValueError(f"Unsupported ckpt_path format: {ckpt_path}")
+
+            else:
+                # 自动找出最近 epoch
+                epoch = self._get_latest_epoch()
+                for name, module in self.submodules.items():
+                    sub_path = self.get_ckpt_path(epoch, name)
+                    module.load_state_dict(torch.load(sub_path), strict=strict)
+
+        except (OSError, KeyError, ValueError) as e:
+            raise OSError(f"Failed to load model from checkpoint: {e}") from e
+
+    def load_model_resume(self, strict: bool = True):
+        """Resume from last checkpoint if available."""
+
+        try:
+            epoch = self._get_latest_epoch()
+
+            # 加载模型每个子模块
+            for name, module in self.submodules.items():
+                path = self.get_ckpt_path(epoch, name)
+                module.load_state_dict(torch.load(path), strict=strict)
+
+            # 加载优化器和meta信息
+            meta_path = os.path.join(
+                self.ckpt_save_dir,
+                f"{self.model_name}_meta_{str(epoch).zfill(len(str(self.num_epochs)))}.pt"
+            )
+            meta = torch.load(meta_path)
+            self.optim.load_state_dict(meta['optim_state_dict'])
+            self.start_epoch = meta['epoch']
+            self.best_metrics = meta.get('best_metrics', {})
+
+            if self.scheduler is not None:
+                self.scheduler.last_epoch = meta['epoch']
+            self.logger.info(f'Resume training from epoch {epoch}')
+
+        except (FileNotFoundError, IndexError, OSError, KeyError) as e:
+            self.logger.warning(f"No checkpoint found, start training from scratch. ({e})")
+            self.start_epoch = 0
+            self.best_metrics = {}
+
+    def _get_latest_epoch(self) -> int:
+        """Scan ckpt_save_dir for latest epoch."""
+        files = os.listdir(self.ckpt_save_dir)
+        epochs = []
+        for f in files:
+            if f.startswith(f"{self.model_name}_meta_") and f.endswith('.pt'):
+                try:
+                    ep = int(f.replace(f"{self.model_name}_meta_", '').replace('.pt', ''))
+                    epochs.append(ep)
+                except ValueError:
+                    continue
+        if not epochs:
+            raise FileNotFoundError("No checkpoint meta files found.")
+        return max(epochs)
+
+    def _get_epoch_from_ckpt_path(self, ckpt_path: str) -> int:
+        """Derive epoch from custom ckpt_path, or use latest."""
+        if ckpt_path is not None:
+            base = os.path.basename(ckpt_path)
+            try:
+                return int(base.replace('.pth', '').split('_')[-1])
+            except Exception as e:
+                raise ValueError(f"Cannot parse epoch from ckpt_path: {ckpt_path}") from e
+        else:
+            return self._get_latest_epoch()
+
+    def get_ckpt_path(self, epoch: int, module_name: str) -> str:
+        """Get checkpoint path for each module.
+
+        Format: "{ckpt_save_dir}/{model_name}_{module_name}_{epoch}.pt"
+        """
+        epoch_str = str(epoch).zfill(len(str(self.num_epochs)))
+        ckpt_name = f"{self.model_name}_{module_name}_{epoch_str}.pt"
+        return os.path.join(self.ckpt_save_dir, ckpt_name)
+
+    @master_only
+    def on_validating_end(self, train_epoch: Optional[int]):
+        """Callback at the end of the validation process.
+
+        Args:
+            train_epoch (Optional[int]): Current epoch if in training process.
+        """
+        greater_best = not self.metrics_best == 'min'
+        valid_epoch = -1
+        if self.model_use_tan:
+            valid_epoch += self.tan_epoch
+
+        if train_epoch is not None and train_epoch >= valid_epoch:
+            self.save_best_model(train_epoch, 'val/' + self.target_metrics, greater_best=greater_best)
 
     def forward(self, data: Dict, epoch: int = None, iter_num: int = None, train: bool = True, freeze_mode=None, **kwargs) -> Dict:
         """
@@ -384,6 +654,7 @@ class NormalizeTimeSeriesForecastingRunner(BaseTimeSeriesForecastingRunner):
         Raises:
             AssertionError: If the shape of the model output does not match [B, L, N].
         """
+        data = self.preprocessing(data)
 
         # Preprocess input data
         future_data, history_data = data['target'], data['inputs']
@@ -395,52 +666,32 @@ class NormalizeTimeSeriesForecastingRunner(BaseTimeSeriesForecastingRunner):
         history_data = self.select_input_features(history_data)
         future_data_4_dec = self.select_input_features(future_data)
 
-        '''if not train:
-            # For non-training phases, use only temporal features
-            future_data_4_dec[..., 0] = torch.empty_like(future_data_4_dec[..., 0])'''
-
         # Forward pass through the model
         model_return = self.model(history_data=history_data, future_data=future_data_4_dec,
                                   batch_seen=iter_num, epoch=epoch, train=train)
 
-
-
-
-        # Parse model return
         if isinstance(model_return, torch.Tensor):
-            model_return = {'prediction': model_return}
+            model_return = {'prediction': model_return['outputs']}
         else:
             model_returns = dict()
-            model_returns['prediction'] = model_return[0]
-            '''if model_return[1].ndimension() == 0:
-                model_returns['lambda'] = model_return[1]
-            else:
-                model_returns['lambda'] = torch.tensor(0.001).to(model_returns['prediction'].device)'''
-            embedding_lst = []
-            for i in range(2, len(model_return)):
-                embedding = model_return[i]
-                # embedding = embedding / embedding.norm(dim=1, keepdim=True)
-                similarity_embedding = torch.mm(embedding, embedding.T)
-                N = similarity_embedding.size(0)
-                # print(N, similarity_embedding.device, similarity_embedding.shape)
-                identity_matrix = torch.eye(N).to(similarity_embedding.device)
-                # print(similarity_embedding)
-                embedding_lst.append([similarity_embedding, identity_matrix])
-            model_returns['orthogonality'] = embedding_lst
+            model_returns['prediction'] = model_return['outputs']
+            embedding_lst = model_return['time_embedding']
+            if self.model_use_tan:
+                model_returns['orthogonality'] = embedding_lst
+                model_returns['stat_pred'] = model_return['stat_pred']
+                model_returns['w'] = model_return['w']
+                model_returns['b'] = model_return['b']
+                model_returns['load'] = model_return['load']
             model_return = model_returns
         if 'inputs' not in model_return:
             model_return['inputs'] = self.select_target_features(history_data)
         if 'target' not in model_return:
             model_return['target'] = self.select_target_features(future_data)
 
-
-        #print(self.normalization_name)
-        '''if self.normalization_name == 'SAN':
-            print(self.model.normalization.station_pred.shape)'''
-
-
         # Ensure the output shape is correct
         assert list(model_return['prediction'].shape)[:3] == [batch_size, length, num_nodes], \
             "The shape of the output is incorrect. Ensure it matches [B, L, N, C]."
         # print(model_return.keys())
+        model_return = self.postprocessing(model_return)
+        # a = orthogonality(model_return['orthogonality'])
         return model_return
