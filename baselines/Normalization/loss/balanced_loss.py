@@ -21,6 +21,6 @@ def balance_loss(load):
     # KL散度损失 (p -> uniform)
     # loss = F.kl_div(p.log(), uniform, reduction='batchmean')
     loss = torch.sum((p - uniform)**2)
-
+    # print('balance: ', loss)
     # 添加可调节系数
     return loss

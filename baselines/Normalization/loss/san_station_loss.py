@@ -1,11 +1,12 @@
 import torch
-from typing import Union, List
 import numpy as np
 import torch.nn as nn
 
 def station_loss(y, statistics_pred, period_len) -> torch.Tensor:
-
-    bs, len, dim = y.shape
+    
+    if len(y.shape) == 2:
+        y = y.unsqueeze(0)
+    bs, l, dim = y.shape
     y = y.reshape(bs, -1,  period_len, dim)
     mean = torch.mean(y, dim=2)
     std = torch.std(y, dim=2)
